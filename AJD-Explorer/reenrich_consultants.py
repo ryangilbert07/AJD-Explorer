@@ -147,41 +147,52 @@ def main():
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--only-missing", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--swg-number", help="Process one exact AJD number")
     args = parser.parse_args()
 
-    setup_new_columns()
+    if not args.dry_run:
+        setup_new_columns()
     client = OpenAI()
     conn = sqlite3.connect(DB_PATH)
 
     query = """
-        SELECT swg_number, full_ocr_text
+        SELECT swg_number, full_ocr_text, consultant
         FROM ajds
         WHERE full_ocr_text IS NOT NULL
           AND TRIM(full_ocr_text) <> ''
     """
 
+    parameters = []
     if args.only_missing:
         query += " AND (consultant IS NULL OR TRIM(consultant) = '')"
+    if args.swg_number:
+        query += " AND swg_number = ?"
+        parameters.append(args.swg_number)
 
     query += " ORDER BY swg_number"
 
     if args.limit:
-        query += f" LIMIT {int(args.limit)}"
+        query += " LIMIT ?"
+        parameters.append(args.limit)
 
-    rows = conn.execute(query).fetchall()
+    rows = conn.execute(query, parameters).fetchall()
     print(f"Consultant records to process: {len(rows)}")
 
-    for index, (swg_number, full_text) in enumerate(rows, start=1):
+    for index, (swg_number, full_text, existing_consultant) in enumerate(rows, start=1):
         result = extract_consultant(client, swg_number, full_text)
         print(
             f"[{index}/{len(rows)}] {swg_number}: "
             f"{result.get('consultant') or 'Not found'} "
             f"({result.get('consultant_confidence', 'low')}; "
-            f"{result.get('consultant_source', 'Not found')})"
+            f"{result.get('consultant_source', 'Not found')}); "
+            f"existing: {existing_consultant or 'Not found'}"
         )
 
         if not args.dry_run:
-            save_consultant(conn, swg_number, result)
+            if result.get("consultant") and result.get("consultant_confidence") in {"high", "medium"}:
+                save_consultant(conn, swg_number, result)
+            else:
+                print("  No supported replacement; existing value preserved.")
 
     conn.close()
 
