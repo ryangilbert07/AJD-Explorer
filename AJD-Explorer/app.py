@@ -11,9 +11,31 @@ import streamlit as st
 from folium.plugins import MarkerCluster
 from openai import OpenAI
 from streamlit_folium import st_folium
+from display_names import (
+    consolidate_feature_type_names,
+    consolidate_consultant_names,
+    normalize_consultant_name,
+    normalize_district_name,
+    normalize_feature_type,
+)
 
 
 DB_PATH = "data/ajds.sqlite"
+
+
+def get_last_jd_update():
+    """Use the latest stored JD update time, independent of deploys."""
+    if not os.path.exists(DB_PATH):
+        return None
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            latest = conn.execute(
+                "SELECT MAX(COALESCE(NULLIF(last_updated, ''), "
+                "NULLIF(date_added, ''))) FROM ajds"
+            ).fetchone()[0]
+        return datetime.fromisoformat(latest) if latest else None
+    except (sqlite3.Error, ValueError, TypeError):
+        return None
 
 
 # ------------------------------------------------------------
@@ -68,6 +90,16 @@ def normalize_outcome(value):
 
     return value
 
+def normalize_district(value):
+    value = normalize_text(value)
+    name = value.lower().removesuffix(" district").strip()
+
+    if name == "galveston":
+        return "Galveston District"
+    if name == "fort worth":
+        return "Fort Worth District"
+
+    return value
 
 def normalize_consultant(value):
     value = normalize_text(value)
@@ -179,7 +211,7 @@ def load_data():
 
         feature_types = sorted(
             {
-                normalize_text(feature.get("feature_type", ""))
+                normalize_feature_type(feature.get("feature_type", ""))
                 for feature in features
                 if isinstance(feature, dict)
                 and normalize_text(feature.get("feature_type", ""))
@@ -262,7 +294,7 @@ def load_data():
         else:
             primary_basis = ""
 
-        consultant = normalize_consultant(row.get("consultant", ""))
+        consultant = normalize_consultant_name(row.get("consultant", ""))
         prepared_by = normalize_prepared_by(row.get("prepared_by", ""))
         approved_by = normalize_approved_by(row.get("approved_by", ""))
 
@@ -300,7 +332,7 @@ def load_data():
                 "Year": year,
                 "JD Date": normalize_text(row.get("issue_date", "")),
                 "JD Type": normalize_text(row.get("jd_type", "")),
-                "USACE District": normalize_text(row.get("district", ""))
+                "USACE District": normalize_district(row.get("district", ""))
                 or "Galveston",
                 "Prepared By": prepared_by,
                 "Approved By": approved_by,
@@ -350,7 +382,7 @@ def load_data():
                     "County": normalize_text(row.get("county", "")),
                     "State": normalize_text(row.get("state", "")),
                     "Feature ID": normalize_text(feature.get("feature_id", "")),
-                    "Feature Type": normalize_text(
+                    "Feature Type": normalize_feature_type(
                         feature.get("feature_type", "")
                     ),
                     "Jurisdictional Status": normalize_outcome(
@@ -362,7 +394,25 @@ def load_data():
                 }
             )
 
-    return pd.DataFrame(records), pd.DataFrame(feature_records)
+    feature_labels = consolidate_feature_type_names(
+        [item["Feature Type"] for item in feature_records]
+    )
+    feature_types_by_jd = {}
+    for item, label in zip(feature_records, feature_labels):
+        item["Feature Type"] = label
+        if label:
+            feature_types_by_jd.setdefault(item["JD ID"], set()).add(label)
+    for item in records:
+        if item["JD ID"] in feature_types_by_jd:
+            item["Feature Type(s)"] = ", ".join(
+                sorted(feature_types_by_jd[item["JD ID"]])
+            )
+
+    ajd_df = pd.DataFrame(records)
+    if not ajd_df.empty:
+        ajd_df["Consultant"] = consolidate_consultant_names(ajd_df["Consultant"])
+        ajd_df["USACE District"] = ajd_df["USACE District"].map(normalize_district_name)
+    return ajd_df, pd.DataFrame(feature_records)
 
 
 # ------------------------------------------------------------
@@ -1048,7 +1098,7 @@ if feature_filter:
     filtered = filtered[
         filtered["Feature Type(s)"].apply(
             lambda value: any(
-                feature in str(value)
+                feature in [part.strip() for part in str(value).split(",")]
                 for feature in feature_filter
             )
         )
@@ -1119,11 +1169,11 @@ st.caption(
     "Jurisdictional Determinations."
 )
 
-if os.path.exists(DB_PATH):
-    db_modified = datetime.fromtimestamp(os.path.getmtime(DB_PATH))
+last_jd_update = get_last_jd_update()
+if last_jd_update:
     st.caption(
-        f"Database last updated: "
-        f"{db_modified.strftime('%Y-%m-%d %H:%M')}"
+        f"JDs last updated: "
+        f"{last_jd_update.strftime('%Y-%m-%d %H:%M')}"
     )
 
 st.warning(
@@ -1164,11 +1214,10 @@ coverage_columns[2].metric(
     fort_worth_count,
 )
 
-if os.path.exists(DB_PATH):
-    db_modified = datetime.fromtimestamp(os.path.getmtime(DB_PATH))
+if last_jd_update:
     coverage_columns[3].metric(
         "Last Updated",
-        db_modified.strftime("%b %d, %Y"),
+        last_jd_update.strftime("%b %d, %Y"),
     )
 else:
     coverage_columns[3].metric(

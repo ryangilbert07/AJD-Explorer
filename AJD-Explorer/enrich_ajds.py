@@ -79,7 +79,14 @@ def setup_new_columns():
             print(f"Added column: {column}")
         except sqlite3.OperationalError:
             print(f"Column already exists: {column}")
-
+    cur.execute("""
+        UPDATE ajds SET district = 'Galveston District'
+        WHERE LOWER(TRIM(district)) IN ('galveston', 'galveston district')
+    """)
+    cur.execute("""
+        UPDATE ajds SET district = 'Fort Worth District'
+        WHERE LOWER(TRIM(district)) IN ('fort worth', 'fort worth district')
+    """)
     conn.commit()
     conn.close()
 

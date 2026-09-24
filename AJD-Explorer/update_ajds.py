@@ -1,6 +1,7 @@
 import os
 import re
 import sqlite3
+import argparse
 from pathlib import Path
 from urllib.parse import urljoin
 
@@ -301,6 +302,9 @@ def print_summary(
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--limit", type=int, default=None)
+    args = parser.parse_args()
     setup_folders()
     setup_chrome_preferences()
     setup_database()
@@ -328,7 +332,8 @@ def main() -> None:
         if item["swg_number"] not in existing
         and item["swg_number"] not in ignored
     ]
-
+    if args.limit is not None:
+        missing = missing[:args.limit]
     print(
         f"Found {len(all_links)} PDF links from "
         f"{CUTOFF_BASIS_YEAR}+ Basis Forms sections."

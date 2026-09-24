@@ -185,6 +185,25 @@ def download_pdf_with_chrome(context, swg_number, pdf_url):
             print(f"Deleting invalid PDF file: {local_path}")
             os.remove(local_path)
 
+    # Browser-session PDF fetch (save_as fallback)
+    # The USACE server sometimes closes Chrome's PDF download page before
+    # Playwright's download.save_as completes. Use the same context's cookies
+    # to request the PDF directly, then keep Chrome's download as fallback.
+    try:
+        print(f"Requesting PDF through browser session: {pdf_url}")
+        response = context.request.get(pdf_url, timeout=90000)
+        content = response.body() if response.ok else b""
+        if content.startswith(b"%PDF-") and len(content) > 1000:
+            temporary_path = local_path + ".part"
+            with open(temporary_path, "wb") as pdf_file:
+                pdf_file.write(content)
+            os.replace(temporary_path, local_path)
+            print(f"Saved valid PDF: {local_path}")
+            return local_path
+        print(f"Browser-session PDF request returned HTTP {response.status}; trying Chrome download.")
+    except Exception as error:
+        print(f"Browser-session PDF request failed: {error}; trying Chrome download.")
+
     print(f"Downloading through Chrome: {pdf_url}")
 
     page = context.new_page()
@@ -254,6 +273,27 @@ def extract_text_with_ocr(local_pdf_path):
             print(f"OCR page {i}")
             text = pytesseract.image_to_string(page, config="--psm 6")
             ocr_text_parts.append(f"=== PAGE {i} ===\n{text}")
+
+        # Small consultant logos in map title blocks can be missed by
+        # whole-page OCR. Scan the lower-right corner of the final pages.
+        for i, page in enumerate(
+            pages[-15:],
+            start=max(1, len(pages) - 14),
+        ):
+            print(f"Map title block OCR page {i}")
+            title_block = page.crop((
+                int(page.width * 0.60),
+                int(page.height * 0.85),
+                page.width,
+                page.height,
+            ))
+            text = pytesseract.image_to_string(
+                title_block,
+                config="--psm 11",
+            )
+            ocr_text_parts.append(
+                f"=== PAGE {i} ===\n[MAP TITLE BLOCK]\n{text}"
+            )
 
     except Exception as e:
         print(f"OCR failed: {e}")

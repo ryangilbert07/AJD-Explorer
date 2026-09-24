@@ -1,8 +1,4 @@
-"""Re-extract consultant names with source evidence and confidence.
-
-Run locally after setting OPENAI_API_KEY. The script updates only consultant
-fields and does not overwrite the other AJD extraction results.
-"""
+"""Re-extract consultant names with source evidence and confidence."""
 
 import argparse
 import json
@@ -10,7 +6,6 @@ import re
 import sqlite3
 
 from openai import OpenAI
-
 from enrich_ajds import DB_PATH, AI_MODEL, setup_new_columns
 
 
@@ -29,36 +24,84 @@ SOURCE_TERMS = (
 )
 
 
-def build_consultant_context(full_text, max_chars=55_000):
-    """Prioritize Section 8/source citations and end-of-PDF map title blocks."""
+def build_consultant_context(full_text, max_chars=24_000):
+    """Put page-labeled map OCR ahead of Section 8 and source excerpts."""
     text = str(full_text or "")
     if len(text) <= max_chars:
         return text
 
-    windows = []
-    lowered = text.lower()
+    chunks = []
+    seen = set()
+    used = 0
+    separator = "\n\n--- DOCUMENT EXCERPT ---\n\n"
+
+    def add(excerpt):
+        nonlocal used
+        excerpt = excerpt.strip()
+        if not excerpt or excerpt in seen:
+            return
+        cost = len(excerpt) + (len(separator) if chunks else 0)
+        if used + cost <= max_chars:
+            chunks.append(excerpt)
+            seen.add(excerpt)
+            used += cost
+
+    map_blocks = re.findall(
+        r"=== PAGE \d+ ===\s*\[MAP TITLE BLOCK\][\s\S]*?(?=\n=== PAGE \d+ ===|\Z)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    for block in map_blocks:
+        if re.search(
+            r"\b(?:consultant|environmental|ecological|wetland|prepared by|swca)\b",
+            block,
+            re.IGNORECASE,
+        ):
+            add(block[:2_000])
+        if used >= max_chars // 3:
+            break
 
     for term in SOURCE_TERMS:
-        for match in re.finditer(re.escape(term), lowered):
-            start = max(0, match.start() - 2_000)
-            end = min(len(text), match.end() + 4_000)
-            windows.append(text[start:end])
+        for match in list(re.finditer(re.escape(term), text, re.IGNORECASE))[:4]:
+            before = text.rfind("=== PAGE ", 0, match.start())
+            prefix = (
+                text[before:before + 30].splitlines()[0]
+                if before >= 0
+                else ""
+            )
+            excerpt = text[
+                max(0, match.start() - 400):
+                min(len(text), match.end() + 1_100)
+            ]
+            add(f"{prefix}\n{excerpt}" if prefix else excerpt)
 
-    unique_windows = []
-    seen = set()
+    add(text[:min(2_500, max_chars - used)])
+    return separator.join(chunks)
 
-    for window in windows:
-        if window in seen:
-            continue
-        seen.add(window)
-        unique_windows.append(window)
 
-    separator = "\n\n--- RELEVANT DOCUMENT EXCERPT ---\n\n"
-    body_budget = max_chars - 20_000 - len(separator)
-    body = separator.join(unique_windows)[:body_budget]
-
-    # Always reserve room for map title blocks near the end of the PDF.
-    return f"{body}{separator}{text[-20_000:]}"[:max_chars]
+def consultant_from_map_title_block(full_text):
+    """Recognize the verified SWCA logo in page-labeled map OCR."""
+    blocks = re.findall(
+        r"=== PAGE (\d+) ===\s*\[MAP TITLE BLOCK\]([\s\S]*?)(?=\n=== PAGE \d+ ===|\Z)",
+        str(full_text or ""),
+        flags=re.IGNORECASE,
+    )
+    for page, block in blocks:
+        if re.search(
+            r"\bSWCA\b[\s\S]{0,220}\bENVIRONMENTAL\s+CONSULTANTS\b",
+            block,
+            flags=re.IGNORECASE,
+        ):
+            return {
+                "consultant": "SWCA Environmental Consultants",
+                "consultant_source": "Map title block",
+                "consultant_page": int(page),
+                "consultant_confidence": "medium",
+                "consultant_evidence": (
+                    "SWCA; ENVIRONMENTAL CONSULTANTS (map title block)"
+                ),
+            }
+    return None
 
 
 def extract_consultant(client, swg_number, full_text):
@@ -81,7 +124,9 @@ Rules:
 1. First inspect Section 8, Sources of Information, Supporting Data, or cited
    delineation/aquatic-resource reports.
 2. If those do not identify the consultant, inspect map title blocks and
-   preparation notes near the end of the PDF.
+   preparation notes near the end of the PDF. A named environmental consulting
+   firm with a logo in a labeled map title block is sufficient for medium
+   confidence; cite the map page and the visible firm name.
 3. Do not confuse the applicant, landowner, surveyor, USACE reviewer, or an
    unrelated civil engineer with the environmental consultant.
 4. Use consultant_source from: "Section 8 / Sources", "Map title block",
@@ -101,11 +146,21 @@ DOCUMENT TEXT:
 
     response = client.responses.create(model=AI_MODEL, input=prompt)
     raw = response.output_text.strip()
+    if raw.startswith("```"):
+        raw = re.sub(
+            r"^```(?:json)?\s*|\s*```$",
+            "",
+            raw,
+            flags=re.IGNORECASE,
+        ).strip()
 
     try:
         result = json.loads(raw)
-    except json.JSONDecodeError:
-        return {
+        if not isinstance(result, dict):
+            raise ValueError("Expected a JSON object")
+    except (json.JSONDecodeError, ValueError):
+        print(f"  Model returned invalid JSON: {raw[:300]!r}")
+        result = {
             "consultant": None,
             "consultant_source": "Not found",
             "consultant_page": None,
@@ -115,6 +170,15 @@ DOCUMENT TEXT:
 
     if result.get("consultant_confidence") == "low":
         result["consultant"] = None
+
+    if not result.get("consultant"):
+        map_result = consultant_from_map_title_block(full_text)
+        if map_result:
+            print(
+                "  Found SWCA Environmental Consultants "
+                "in page-labeled map OCR."
+            )
+            return map_result
 
     return result
 
@@ -178,7 +242,9 @@ def main():
     rows = conn.execute(query, parameters).fetchall()
     print(f"Consultant records to process: {len(rows)}")
 
-    for index, (swg_number, full_text, existing_consultant) in enumerate(rows, start=1):
+    for index, (swg_number, full_text, existing_consultant) in enumerate(
+        rows, start=1
+    ):
         result = extract_consultant(client, swg_number, full_text)
         print(
             f"[{index}/{len(rows)}] {swg_number}: "
@@ -189,7 +255,10 @@ def main():
         )
 
         if not args.dry_run:
-            if result.get("consultant") and result.get("consultant_confidence") in {"high", "medium"}:
+            if (
+                result.get("consultant")
+                and result.get("consultant_confidence") in {"high", "medium"}
+            ):
                 save_consultant(conn, swg_number, result)
             else:
                 print("  No supported replacement; existing value preserved.")
