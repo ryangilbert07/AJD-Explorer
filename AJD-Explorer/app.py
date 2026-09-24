@@ -188,8 +188,13 @@ def load_data():
     conn = sqlite3.connect(DB_PATH)
 
     try:
+        # The main page needs structured fields, not every PDF's OCR.
+        column_names = [
+            column[1] for column in conn.execute("PRAGMA table_info(ajds)")
+            if column[1] != "full_ocr_text"
+        ]
         raw_df = pd.read_sql_query(
-            "SELECT * FROM ajds ORDER BY swg_number DESC",
+            f"SELECT {', '.join(column_names)} FROM ajds ORDER BY swg_number DESC",
             conn,
         )
     finally:
@@ -367,7 +372,7 @@ def load_data():
                 "Latitude": latitude,
                 "Longitude": longitude,
                 "Quality Flag": quality_flag,
-                "Full OCR Text": normalize_text(row.get("full_ocr_text", "")),
+                "Full OCR Text": "",  # Retrieved from SQLite only when needed.
                 "Full Record": row.to_dict(),
             }
         )
@@ -447,6 +452,29 @@ def marker_color(outcome):
 # ------------------------------------------------------------
 # AI search helpers
 # ------------------------------------------------------------
+
+# OCR memory optimization: read one JD at a time, including during search.
+def get_ocr_text(jd_id):
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT full_ocr_text FROM ajds WHERE swg_number = ?", (jd_id,)
+        ).fetchone()
+    return (row[0] or "") if row else ""
+
+
+def iter_ocr_rows(source_df):
+    """Attach OCR to one row at a time; never cache the full OCR dataset."""
+    with sqlite3.connect(DB_PATH) as conn:
+        for _, metadata in source_df.iterrows():
+            row = metadata.copy()
+            result = conn.execute(
+                "SELECT full_ocr_text FROM ajds WHERE swg_number = ?",
+                (row["JD ID"],),
+            ).fetchone()
+            row["Full OCR Text"] = (result[0] or "") if result else ""
+            yield row
+
+
 
 def build_search_text(row):
     return " ".join(
@@ -628,7 +656,7 @@ def retrieve_pdf_passages(
     terms = normalize_query_terms(question)
     candidates = []
 
-    for _, row in source_df.iterrows():
+    for row in iter_ocr_rows(source_df):
         jd_candidates = []
 
         for chunk_number, chunk in enumerate(
@@ -719,7 +747,7 @@ def retrieve_relevant_records(question, source_df, ai_record_limit=20):
 
     scored_matches = []
 
-    for _, row in source_df.iterrows():
+    for row in iter_ocr_rows(source_df):
         if required_county and row.get("County", "") != required_county:
             continue
 
@@ -761,7 +789,7 @@ def retrieve_relevant_records(question, source_df, ai_record_limit=20):
         scored_matches.append(
             {
                 "score": score,
-                "row": row,
+                "row": row.drop(labels=["Full OCR Text"]),
                 "matched_terms": matched_terms,
             }
         )
@@ -1068,9 +1096,19 @@ filtered = df.copy()
 
 if keyword:
     keyword_lower = keyword.lower()
+    # Search OCR inside SQLite, keeping it out of the Streamlit dataframe.
+    with sqlite3.connect(DB_PATH) as conn:
+        ocr_matches = {
+            row[0] for row in conn.execute(
+                "SELECT swg_number FROM ajds "
+                "WHERE instr(lower(full_ocr_text), ?) > 0",
+                (keyword_lower,),
+            )
+        }
     filtered = filtered[
         filtered.apply(
-            lambda row: keyword_lower in str(row).lower(),
+            lambda row: keyword_lower in str(row).lower()
+            or row["JD ID"] in ocr_matches,
             axis=1,
         )
     ]
@@ -1957,10 +1995,16 @@ with tabs[3]:
             )
 
         with st.expander("Full OCR Text"):
-            st.write(selected_row["Full OCR Text"])
+            st.write(get_ocr_text(selected_row["JD ID"]))
 
         with st.expander("Full Database Record"):
-            st.json(selected_row["Full Record"])
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.row_factory = sqlite3.Row
+                full_record = conn.execute(
+                    "SELECT * FROM ajds WHERE swg_number = ?",
+                    (selected_row["JD ID"],),
+                ).fetchone()
+            st.json(dict(full_record) if full_record else {})
 
 
 with tabs[4]:
@@ -1972,7 +2016,7 @@ with tabs[4]:
 
     csv_ajds = (
         filtered
-        .drop(columns=["Full Record"], errors="ignore")
+        .drop(columns=["Full Record", "Full OCR Text"], errors="ignore")
         .to_csv(index=False)
         .encode("utf-8")
     )
@@ -2000,7 +2044,7 @@ with tabs[4]:
 
     excel_file = make_excel_download(
         filtered.drop(
-            columns=["Full Record"],
+            columns=["Full Record", "Full OCR Text"],
             errors="ignore",
         ),
         visible_features,
